@@ -8,8 +8,9 @@ const pw = @import("./bindings/pw.zig");
 const pod = @import("./bindings/spa_pod.zig");
 const dbus = @import("./bindings/dbus.zig");
 
+const AtomicRingBuffer = @import("./AtomicRingBuffer.zig");
+
 const c = @cImport({
-    @cInclude("opus/opus.h");
     @cInclude("quiche.h");
     @cInclude("netinet/in.h");
     @cInclude("uv.h");
@@ -19,7 +20,7 @@ var g_input_m = std.Thread.Mutex{};
 var g_input_c = std.Thread.Condition{};
 var g_input_ringbuf: std.RingBuffer = undefined;
 var g_output_m = std.Thread.Mutex{};
-var g_output_ringbuf: std.RingBuffer = undefined;
+var g_output_ringbuf: AtomicRingBuffer = undefined;
 var g_opus_encoder: *c.OpusEncoder = undefined;
 var g_output_notif: c.uv_async_t = undefined;
 
@@ -43,11 +44,9 @@ pub fn input_encoder(ally: std.mem.Allocator) void {
             const payload_sz_or_err = c.opus_encode_float(g_opus_encoder, @ptrCast(encode_input_buf.ptr), @intCast(encode_input_buf.len / 8), encoded_frame.ptr, 1276);
             if (payload_sz_or_err < 0) unreachable;
 
-            g_output_m.lock();
             g_output_ringbuf.writeSlice(encoded_frame[0..@intCast(payload_sz_or_err)]) catch {
                 std.log.warn("output buffer overflow. lost {} bytes", .{payload_sz_or_err});
             };
-            g_output_m.unlock();
             _ = c.uv_async_send(&g_output_notif);
             //std.log.info("encoder: output {} bytes", .{payload_sz_or_err});
         }
@@ -165,36 +164,6 @@ fn uv_output_notif_cb(_: ?*c.uv_async_t) callconv(.C) void {
 
 fn start_business(uv_loop: *c.uv_loop_t) !void {
     const ally = std.heap.c_allocator;
-    g_opus_encoder = c.opus_encoder_create(48000, 2, c.OPUS_APPLICATION_VOIP, null).?;
-
-    if (c.uv_async_init(uv_loop, &g_output_notif, uv_output_notif_cb) < 0) {
-        return error.UvError;
-    }
-
-    g_input_ringbuf = try std.RingBuffer.init(ally, 2 * 7680);
-    g_output_ringbuf = try std.RingBuffer.init(ally, 4096);
-    const thread = try std.Thread.spawn(.{}, input_encoder, .{ally});
-    thread.detach();
-
-    g_pw_loop = pw.ThreadLoop.new();
-    const audio_format = pod.object(.format, 3, .{
-        pod.prop(SpaFormatProps.MediaType, pod.id(SpaMediaType.Audio)),
-        pod.prop(SpaFormatProps.MediaSubtype, pod.id(SpaMediaSubtype.Raw)),
-        pod.prop(SpaFormatProps.AudioFormat, pod.id(283)),
-        pod.prop(SpaFormatProps.AudioRate, pod.int(48000)),
-        pod.prop(SpaFormatProps.AudioChannels, pod.int(2)),
-    });
-    const evt = try ally.create(pw.StreamEvents(MicrophoneStreamEvents));
-    evt.* = pw.StreamEvents(MicrophoneStreamEvents).new(.{
-        .id = "microphone",
-    });
-    const strm = pw.Stream.new(g_pw_loop.get_loop(), "Agora", .{
-        .mediaType = .audio,
-        .mediaCategory = .capture,
-        .mediaRole = .communication,
-    }, evt);
-    evt.object.stream = strm;
-    try strm.connect(.input, .{audio_format});
 
     try g_pw_loop.start();
 }
